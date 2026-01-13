@@ -1,0 +1,13 @@
+# Build artifacts
+**/build/
+opengles/angle-gles-demo/Lib
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE
+.vscode/
+
+# System
+.DS_Store
