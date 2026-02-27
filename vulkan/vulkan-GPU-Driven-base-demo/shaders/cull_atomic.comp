@@ -1,0 +1,106 @@
+// ============================================================
+// cull_atomic.comp - Frustum Culling (atomicAdd 方式)
+// ============================================================
+// 
+// 原理：每个线程检测一个实例是否在视锥体内。
+// 如果可见，使用 atomicAdd 获取写入位置，将实例 ID 写入输出缓冲区。
+// 同时更新 IndirectDrawCommand.instanceCount。
+//
+// 优点：实现简单，代码直观
+// 缺点：原子操作竞争激烈时性能下降；输出顺序不确定
+// ============================================================
+
+#version 450
+
+// 每个工作组 64 个线程
+layout(local_size_x = 64) in;
+
+// ─── 数据结构 ───
+
+// 实例数据：位置(xyz) + 缩放(w)，颜色(rgba)
+struct InstanceData {
+    vec4 positionScale; // xyz = 世界空间位置, w = 统一缩放系数
+    vec4 color;         // rgb = 颜色, a = 未使用
+};
+
+// ─── Uniform Buffer: 视锥体裁剪参数 ───
+layout(set = 0, binding = 0) uniform CullUBO {
+    mat4 viewProj;          // View * Projection 矩阵
+    vec4 frustumPlanes[6];  // 6个视锥体平面 (xyz=法线, w=距离)
+    uint instanceCount;     // 实例总数
+    uint pad0, pad1, pad2;  // 16字节对齐填充
+};
+
+// ─── Storage Buffers ───
+
+// 输入: 所有实例的数据 (只读)
+layout(std430, set = 0, binding = 1) readonly buffer InstanceBuffer {
+    InstanceData instances[];
+};
+
+// 输出: VkDrawIndexedIndirectCommand (读写)
+// ┌──────────────┬──────────────────┬────────────┬──────────────┬───────────────┐
+// │ indexCount(4) │ instanceCount(4) │ firstIdx(4)│ vtxOffset(4) │ firstInst(4)  │
+// │   = 36       │   = 可见数量      │   = 0      │   = 0        │   = 0         │
+// └──────────────┴──────────────────┴────────────┴──────────────┴───────────────┘
+layout(std430, set = 0, binding = 2) buffer IndirectBuffer {
+    uint indexCount;     // 立方体索引数 (固定 36)
+    uint visibleCount;   // 可见实例数 (通过 atomicAdd 累加)
+    uint firstIndex;     // 第一个索引偏移 (固定 0)
+    uint vertexOffset;   // 顶点偏移 (固定 0)
+    uint firstInstance;  // 第一个实例偏移 (固定 0)
+};
+
+// 输出: 可见实例 ID 列表 (读写)
+layout(std430, set = 0, binding = 3) buffer VisibleBuffer {
+    uint visibleIDs[]; // visibleIDs[i] = 第 i 个可见实例的原始索引
+};
+
+// ─── 视锥体检测函数 ───
+// 使用包围球 (Bounding Sphere) 与 6 个平面做相交测试
+// center: 球心世界坐标
+// radius: 球半径
+// 返回: true=在视锥体内(可见), false=在视锥体外(被裁剪)
+bool isInsideFrustum(vec3 center, float radius) {
+    for (int i = 0; i < 6; i++) {
+        // 平面方程: dot(normal, point) + d = 有符号距离
+        float dist = dot(frustumPlanes[i].xyz, center) + frustumPlanes[i].w;
+        // 如果距离 < -radius，球体完全在平面外侧 → 被裁剪
+        if (dist < -radius) {
+            return false;
+        }
+    }
+    // 通过所有 6 个平面测试 → 可见
+    return true;
+}
+
+// ─── 主函数 ───
+void main() {
+    // 获取全局线程 ID (对应一个实例)
+    uint gid = gl_GlobalInvocationID.x;
+
+    // 越界检查: 跳过超出实例数量的线程
+    if (gid >= instanceCount) return;
+
+    // 读取实例数据
+    vec3 center = instances[gid].positionScale.xyz; // 实例中心位置
+    float scale = instances[gid].positionScale.w;   // 实例缩放
+
+    // 计算包围球半径
+    // 单位立方体对角线 = sqrt(3) ≈ 1.732
+    // 包围球半径 = 对角线/2 * 缩放 ≈ 0.866 * scale
+    float radius = 0.866 * scale;
+
+    // 执行视锥体裁剪测试
+    if (isInsideFrustum(center, radius)) {
+        // *** atomicAdd 核心操作 ***
+        // atomicAdd 返回旧值作为写入索引
+        // 多个线程同时写入时，每个线程获得唯一的索引
+        // 注意: 写入顺序不确定 (取决于线程执行顺序)
+        uint writeIndex = atomicAdd(visibleCount, 1);
+
+        // 将可见实例的原始 ID 写入输出缓冲区
+        visibleIDs[writeIndex] = gid;
+    }
+    // 不可见的实例: 什么都不做，自然被跳过
+}

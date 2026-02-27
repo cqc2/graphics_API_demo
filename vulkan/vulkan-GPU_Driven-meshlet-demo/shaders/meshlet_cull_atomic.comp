@@ -1,0 +1,138 @@
+// ============================================================
+// meshlet_cull_atomic.comp - Meshlet Frustum Culling (atomicAdd)
+// ============================================================
+//
+// 数据流: Instance × Meshlet → Frustum Test → Visible DrawCommand
+//
+// 每个线程处理一个 (instanceID, meshletID) 组合。
+// 将 meshlet 的 bounding sphere 变换到世界空间后做视锥体测试。
+// 可见的 meshlet 通过 atomicAdd 获得写入槽位，
+// 写入一个完整的 VkDrawIndexedIndirectCommand。
+//
+// 与传统实例级裁剪的区别:
+//   传统: 1 instance → 1 draw (整个 mesh 要么画要么不画)
+//   Meshlet: 1 instance × N meshlets → N 个独立裁剪单元
+//   大物体部分超出视锥体时，只有可见 meshlet 被绘制
+//
+// 为什么 meshlet 更适合 GPU Driven:
+//   1. 粒度更细 — 裁剪精度更高，减少无效三角形
+//   2. 每个 meshlet 有独立 bounding sphere，可做 LOD/遮挡剔除
+//   3. 与 mesh shader 天然契合 (meshlet = task shader 输出单元)
+//   4. 间接绘制命令数 = 可见 meshlet 数，GPU 完全自主决定
+// ============================================================
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+// ─── 数据结构 ───
+
+struct InstanceData {
+    vec4 positionScale; // xyz = 世界位置, w = 缩放
+    vec4 color;         // rgb = 颜色
+};
+
+// Meshlet 描述符 (模型空间)
+// 每个 meshlet ≤ 64 顶点, ≤ 126 三角形
+struct Meshlet {
+    uint indexOffset;       // 在全局索引缓冲中的偏移 (以索引为单位)
+    uint indexCount;        // 索引数 (triangleCount × 3)
+    uint pad0, pad1;        // 对齐到 16 字节
+    vec4 boundingSphere;    // xyz = 球心(模型空间), w = 半径
+};
+
+// VkDrawIndexedIndirectCommand 等价结构
+struct DrawCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+
+// ─── Bindings ───
+
+layout(set = 0, binding = 0) uniform CullUBO {
+    mat4 viewProj;          // View × Projection
+    vec4 frustumPlanes[6];  // 视锥体 6 平面 (xyz=法线, w=距离)
+    uint instanceCount;     // 实例总数
+    uint meshletsPerMesh;   // 每个 mesh 的 meshlet 数量
+    uint maxDrawCount;      // indirect buffer 最大容量
+    uint pad;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer InstanceBuffer {
+    InstanceData instances[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer MeshletBuffer {
+    Meshlet meshlets[];
+};
+
+// 输出: 间接绘制命令数组
+layout(std430, set = 0, binding = 3) buffer DrawCmdBuffer {
+    DrawCommand draws[];
+};
+
+// 输出: 可见绘制命令计数 (原子计数器)
+layout(std430, set = 0, binding = 4) buffer DrawCountBuffer {
+    uint drawCount;
+};
+
+// ─── 视锥体测试 ───
+bool isInsideFrustum(vec3 center, float radius) {
+    for (int i = 0; i < 6; i++) {
+        float dist = dot(frustumPlanes[i].xyz, center) + frustumPlanes[i].w;
+        if (dist < -radius) return false;
+    }
+    return true;
+}
+
+// ─── 主函数 ───
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    // 总的 meshlet-instance 数量
+    uint totalMeshletInstances = instanceCount * meshletsPerMesh;
+    if (gid >= totalMeshletInstances) return;
+
+    // 从线性 ID 解码 instanceID 和 meshletID
+    uint instanceID = gid / meshletsPerMesh;
+    uint meshletID  = gid % meshletsPerMesh;
+
+    // 读取实例变换
+    vec3 instPos   = instances[instanceID].positionScale.xyz;
+    float instScale = instances[instanceID].positionScale.w;
+
+    // 读取 meshlet bounding sphere (模型空间)
+    vec4 bs = meshlets[meshletID].boundingSphere;
+
+    // 变换到世界空间
+    // center_world = center_model × scale + position
+    // radius_world = radius_model × scale
+    vec3  worldCenter = bs.xyz * instScale + instPos;
+    float worldRadius = bs.w   * instScale;
+
+    // 视锥体裁剪
+    if (isInsideFrustum(worldCenter, worldRadius)) {
+        // *** atomicAdd: 获取唯一写入槽位 ***
+        // 优点: 实现简单
+        // 缺点: 高竞争时性能下降; 输出顺序不确定
+        //
+        // 移动端注意: Mali/Adreno 等 GPU 的 atomicAdd 延迟较高
+        // 当可见 meshlet 数量大时 (数千+)，原子操作瓶颈会明显
+        uint writeIdx = atomicAdd(drawCount, 1);
+
+        // 安全检查: 不超出 buffer 容量
+        if (writeIdx < maxDrawCount) {
+            // 写入 VkDrawIndexedIndirectCommand
+            draws[writeIdx].indexCount    = meshlets[meshletID].indexCount;
+            draws[writeIdx].instanceCount = 1;  // 每个 meshlet draw 只画 1 个实例
+            draws[writeIdx].firstIndex    = meshlets[meshletID].indexOffset;
+            draws[writeIdx].vertexOffset  = 0;
+            // firstInstance 编码: 低 16 位 = instanceID, 高 16 位 = meshletID
+            // 顶点着色器通过 gl_InstanceIndex 解码
+            draws[writeIdx].firstInstance = instanceID | (meshletID << 16);
+        }
+    }
+}

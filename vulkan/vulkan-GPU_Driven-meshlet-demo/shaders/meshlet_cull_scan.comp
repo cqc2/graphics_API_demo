@@ -1,0 +1,206 @@
+// ============================================================
+// meshlet_cull_scan.comp - Meshlet Frustum Culling (Prefix Sum)
+// ============================================================
+//
+// 原理:
+//   Step 1: 每线程做视锥体测试 → 可见性标记 (0 或 1)
+//   Step 2: 工作组内 Blelloch Exclusive Prefix Sum
+//   Step 3: 每个工作组一次 atomicAdd 获取全局偏移
+//   Step 4: 可见 meshlet 按 prefix sum 偏移写入绘制命令
+//
+// 与 atomicAdd 方式对比:
+//   atomicAdd: 每个可见 meshlet 一次 atomic → 竞争激烈
+//   scan:      每个工作组一次 atomic → 竞争大幅减少
+//
+// 移动端 GPU 性能注意事项:
+//   1. atomicAdd: 简单但 Mali/Adreno 上延迟高 (~100 cycles)
+//      当可见对象多时成为瓶颈
+//   2. prefix sum: 原子操作从 N 次降到 N/64 次
+//      共享内存 scan 延迟低 (~10 cycles)
+//      总体更适合移动端
+//   3. 但 scan 增加了共享内存用量和 barrier 开销
+//      对于可见率低的场景，atomicAdd 可能更快
+//   4. 建议: 移动端默认 prefix sum, 桌面端两种均可
+// ============================================================
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+// ─── 数据结构 ───
+
+struct InstanceData {
+    vec4 positionScale;
+    vec4 color;
+};
+
+struct Meshlet {
+    uint indexOffset;
+    uint indexCount;
+    uint pad0, pad1;
+    vec4 boundingSphere;
+};
+
+struct DrawCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+
+// ─── Bindings ───
+
+layout(set = 0, binding = 0) uniform CullUBO {
+    mat4 viewProj;
+    vec4 frustumPlanes[6];
+    uint instanceCount;
+    uint meshletsPerMesh;
+    uint maxDrawCount;
+    uint pad;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer InstanceBuffer {
+    InstanceData instances[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer MeshletBuffer {
+    Meshlet meshlets[];
+};
+
+layout(std430, set = 0, binding = 3) buffer DrawCmdBuffer {
+    DrawCommand draws[];
+};
+
+layout(std430, set = 0, binding = 4) buffer DrawCountBuffer {
+    uint drawCount;
+};
+
+// ─── 共享内存 ───
+shared uint sharedVisible[64];     // 可见性标记 (0 或 1)
+shared uint sharedPrefixSum[64];   // Exclusive prefix sum
+shared uint sharedGroupOffset;     // 工作组全局偏移
+shared uint sharedGroupCount;      // 工作组内总可见数 (广播用)
+
+// ─── 每个线程缓存的 meshlet 绘制信息 ───
+shared uint sharedInstanceID[64];
+shared uint sharedMeshletID[64];
+
+// ─── 视锥体测试 ───
+bool isInsideFrustum(vec3 center, float radius) {
+    for (int i = 0; i < 6; i++) {
+        float dist = dot(frustumPlanes[i].xyz, center) + frustumPlanes[i].w;
+        if (dist < -radius) return false;
+    }
+    return true;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint wgSize = gl_WorkGroupSize.x; // = 64
+
+    uint totalMeshletInstances = instanceCount * meshletsPerMesh;
+
+    // ═══ Step 1: 视锥体测试 ═══
+    uint visible = 0;
+    uint instanceID = 0;
+    uint meshletID = 0;
+
+    if (gid < totalMeshletInstances) {
+        instanceID = gid / meshletsPerMesh;
+        meshletID  = gid % meshletsPerMesh;
+
+        vec3 instPos   = instances[instanceID].positionScale.xyz;
+        float instScale = instances[instanceID].positionScale.w;
+
+        vec4 bs = meshlets[meshletID].boundingSphere;
+        vec3 worldCenter = bs.xyz * instScale + instPos;
+        float worldRadius = bs.w   * instScale;
+
+        visible = isInsideFrustum(worldCenter, worldRadius) ? 1 : 0;
+    }
+
+    sharedVisible[lid]    = visible;
+    sharedPrefixSum[lid]  = visible;
+    sharedInstanceID[lid] = instanceID;
+    sharedMeshletID[lid]  = meshletID;
+    barrier();
+
+    // ═══ Step 2: Blelloch Exclusive Prefix Sum ═══
+    //
+    // 例: [1, 0, 1, 1, 0, 1, 0, 1] (8 elements)
+    //
+    // 上扫 (Up-Sweep): 树形累加
+    //   stride=1: [1, 1, 1, 2, 0, 1, 0, 2]
+    //   stride=2: [1, 1, 1, 3, 0, 1, 0, 3]
+    //   stride=4: [1, 1, 1, 3, 0, 1, 0, 5]
+    //
+    // 置零: 最后元素设为 0
+    //   [1, 1, 1, 3, 0, 1, 0, 0]
+    //
+    // 下扫 (Down-Sweep): 交换 + 累加
+    //   stride=4: [1, 1, 1, 0, 0, 1, 0, 3]
+    //   stride=2: [1, 0, 1, 1, 0, 3, 0, 3]
+    //   stride=1: [0, 1, 1, 2, 3, 3, 4, 4]
+    //
+    // 结果: exclusive prefix sum
+    //   第 i 项 = 下标 < i 的所有可见标记之和
+    //   即: 该线程在输出中的局部偏移
+
+    // ── 上扫 (Reduce) ──
+    for (uint stride = 1; stride < wgSize; stride <<= 1) {
+        uint idx = (lid + 1) * (stride << 1) - 1;
+        if (idx < wgSize) {
+            sharedPrefixSum[idx] += sharedPrefixSum[idx - stride];
+        }
+        barrier();
+    }
+
+    // ── 保存工作组内总可见数, 然后置零最后元素 ──
+    uint groupVisibleCount = 0;
+    if (lid == 0) {
+        groupVisibleCount = sharedPrefixSum[wgSize - 1];
+        sharedPrefixSum[wgSize - 1] = 0;
+    }
+    barrier();
+
+    // 广播 groupVisibleCount (lid==0 读取后需要其他线程看到)
+    if (lid == 0) sharedGroupCount = groupVisibleCount;
+    barrier();
+    groupVisibleCount = sharedGroupCount;
+
+    // ── 下扫 (Distribute) ──
+    for (uint stride = wgSize >> 1; stride > 0; stride >>= 1) {
+        uint idx = (lid + 1) * (stride << 1) - 1;
+        if (idx < wgSize) {
+            uint temp = sharedPrefixSum[idx - stride];
+            sharedPrefixSum[idx - stride] = sharedPrefixSum[idx];
+            sharedPrefixSum[idx] += temp;
+        }
+        barrier();
+    }
+
+    // ═══ Step 3: 获取全局写入偏移 ═══
+    // 只有 thread 0 做一次 atomicAdd → 极大减少原子操作竞争
+    if (lid == 0 && groupVisibleCount > 0) {
+        sharedGroupOffset = atomicAdd(drawCount, groupVisibleCount);
+    }
+    barrier();
+
+    // ═══ Step 4: 写入可见 meshlet 的绘制命令 ═══
+    if (sharedVisible[lid] == 1 && gid < totalMeshletInstances) {
+        uint globalIdx = sharedGroupOffset + sharedPrefixSum[lid];
+
+        if (globalIdx < maxDrawCount) {
+            uint mID = sharedMeshletID[lid];
+            uint iID = sharedInstanceID[lid];
+
+            draws[globalIdx].indexCount    = meshlets[mID].indexCount;
+            draws[globalIdx].instanceCount = 1;
+            draws[globalIdx].firstIndex    = meshlets[mID].indexOffset;
+            draws[globalIdx].vertexOffset  = 0;
+            draws[globalIdx].firstInstance  = iID | (mID << 16);
+        }
+    }
+}

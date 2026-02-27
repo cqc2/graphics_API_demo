@@ -1,0 +1,145 @@
+// ============================================================
+// cull_scan.comp - Frustum Culling (Prefix Sum / Scan 方式)
+// ============================================================
+//
+// 原理：
+//   Step 1: 每个线程做视锥体测试，将结果(0/1)写入共享内存
+//   Step 2: 在工作组内执行 Blelloch Exclusive Prefix Sum (扫描)
+//           计算每个可见实例的写入偏移
+//   Step 3: 每个工作组用一次 atomicAdd 获取全局写入偏移
+//   Step 4: 可见实例根据 prefix sum 结果写入输出缓冲区
+//
+// 优点：
+//   - 保持工作组内实例的原始顺序
+//   - 原子操作次数 = 工作组数 (而非可见实例数)，大幅减少竞争
+//   - 更适合 GPU 架构中原子操作开销大的场景
+//
+// 缺点：
+//   - 代码复杂度更高
+//   - 需要共享内存
+//   - 工作组间的顺序仍不确定
+// ============================================================
+
+#version 450
+
+// 工作组大小: 必须是 2 的幂 (Blelloch scan 要求)
+layout(local_size_x = 64) in;
+
+// ─── 数据结构 (与 cull_atomic.comp 相同) ───
+
+struct InstanceData {
+    vec4 positionScale; // xyz = 位置, w = 缩放
+    vec4 color;         // rgb = 颜色
+};
+
+layout(set = 0, binding = 0) uniform CullUBO {
+    mat4 viewProj;
+    vec4 frustumPlanes[6];
+    uint instanceCount;
+    uint pad0, pad1, pad2;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer InstanceBuffer {
+    InstanceData instances[];
+};
+
+layout(std430, set = 0, binding = 2) buffer IndirectBuffer {
+    uint indexCount;
+    uint visibleCount;
+    uint firstIndex;
+    uint vertexOffset;
+    uint firstInstance;
+};
+
+layout(std430, set = 0, binding = 3) buffer VisibleBuffer {
+    uint visibleIDs[];
+};
+
+// ─── 共享内存 ───
+shared uint sharedVisible[64];    // 每个线程的可见性标志 (0 或 1)
+shared uint sharedPrefixSum[64];  // Exclusive prefix sum 结果
+shared uint sharedGroupOffset;    // 本工作组在全局输出中的起始偏移
+
+// ─── 视锥体检测 (与 cull_atomic.comp 相同) ───
+bool isInsideFrustum(vec3 center, float radius) {
+    for (int i = 0; i < 6; i++) {
+        float dist = dot(frustumPlanes[i].xyz, center) + frustumPlanes[i].w;
+        if (dist < -radius) return false;
+    }
+    return true;
+}
+
+// ─── 主函数 ───
+void main() {
+    uint gid = gl_GlobalInvocationID.x; // 全局线程 ID
+    uint lid = gl_LocalInvocationID.x;  // 工作组内局部线程 ID
+    uint wgSize = gl_WorkGroupSize.x;   // 工作组大小 (64)
+
+    // ═══ Step 1: 视锥体测试 ═══
+    // 每个线程检测对应实例，结果写入共享内存
+    uint visible = 0;
+    if (gid < instanceCount) {
+        vec3 center = instances[gid].positionScale.xyz;
+        float scale = instances[gid].positionScale.w;
+        float radius = 0.866 * scale;
+        visible = isInsideFrustum(center, radius) ? 1 : 0;
+    }
+    sharedVisible[lid] = visible;     // 保存可见性标志
+    sharedPrefixSum[lid] = visible;   // 初始化 prefix sum 数组
+    barrier(); // 等待所有线程完成写入
+
+    // ═══ Step 2: Blelloch Exclusive Prefix Sum ═══
+    // 此算法分两个阶段：上扫 (Up-Sweep) 和下扫 (Down-Sweep)
+    //
+    // 示例 (8个元素): [1, 0, 1, 1, 0, 1, 0, 1]
+    //
+    // 上扫后: [1, 1, 1, 3, 0, 1, 0, 5]  (树形累加)
+    // 置零:   [1, 1, 1, 3, 0, 1, 0, 0]  (最后元素设为0)
+    // 下扫后: [0, 1, 1, 2, 3, 3, 4, 4]  (exclusive prefix sum)
+    //
+    // 含义: 第 i 个元素的值 = 前 i 个元素中 1 的个数
+    //       即该可见实例应写入的相对位置
+
+    // ─── 上扫 (Reduce) 阶段 ───
+    // 将数组规约为树状结构，最终最后一个元素存储总和
+    for (uint stride = 1; stride < wgSize; stride *= 2) {
+        uint index = (lid + 1) * stride * 2 - 1;
+        if (index < wgSize) {
+            sharedPrefixSum[index] += sharedPrefixSum[index - stride];
+        }
+        barrier(); // 每步完成后同步
+    }
+
+    // ─── 获取全局偏移 ───
+    // 只有第一个线程执行：
+    //   1. 读取本工作组的可见总数 (存储在最后一个元素)
+    //   2. 用一次 atomicAdd 获取本组在全局输出中的起始位置
+    //   3. 将最后一个元素设为 0 (exclusive scan 要求)
+    if (lid == 0) {
+        uint totalVisible = sharedPrefixSum[wgSize - 1];
+        // *** 每个工作组只需一次 atomicAdd (而非每个可见实例一次) ***
+        sharedGroupOffset = (totalVisible > 0) ? atomicAdd(visibleCount, totalVisible) : 0;
+        sharedPrefixSum[wgSize - 1] = 0; // 为 exclusive scan 置零
+    }
+    barrier();
+
+    // ─── 下扫 (Down-Sweep) 阶段 ───
+    // 将累加结果传播回数组，生成 exclusive prefix sum
+    for (uint stride = wgSize / 2; stride > 0; stride /= 2) {
+        uint index = (lid + 1) * stride * 2 - 1;
+        if (index < wgSize) {
+            uint temp = sharedPrefixSum[index - stride]; // 保存左子节点
+            sharedPrefixSum[index - stride] = sharedPrefixSum[index]; // 左 ← 父
+            sharedPrefixSum[index] += temp; // 父 += 原始左
+        }
+        barrier(); // 每步完成后同步
+    }
+
+    // ═══ Step 3: 写入可见实例 ID ═══
+    // 每个可见线程根据 prefix sum 计算的位置写入
+    if (gid < instanceCount && sharedVisible[lid] == 1) {
+        // writeIndex = 工作组全局偏移 + 组内局部偏移
+        uint writeIndex = sharedGroupOffset + sharedPrefixSum[lid];
+        visibleIDs[writeIndex] = gid;
+    }
+}

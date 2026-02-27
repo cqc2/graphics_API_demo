@@ -1,19 +1,20 @@
 // ════════════════════════════════════════════════════════════
-// CPU Driven Rendering Demo - 1000 个立方体实例化 + CPU Frustum Culling
+// GPU Driven Rendering Demo - 1000 个立方体实例化 + GPU Frustum Culling
 // ════════════════════════════════════════════════════════════
 //
-// 传统渲染方式 (与 GPU Driven 版本对比):
+// 整体流程:
 //   1. CPU 生成 1000 个实例数据 (位置/颜色/缩放)
 //   2. 每帧:
-//      a. CPU 计算视锥体平面
-//      b. CPU 遍历所有实例做 frustum culling ← 区别! (GPU版在compute shader中做)
-//      c. CPU 将可见实例 ID 列表上传到 GPU
-//      d. 使用 vkCmdDrawIndexed 绘制 ← 区别! (GPU版用 vkCmdDrawIndexedIndirect)
-//   3. CPU 负责所有裁剪计算
+//      a. CPU 更新视锥体参数 (UBO)
+//      b. GPU Compute Shader 做 frustum culling
+//      c. Compute 写入 indirect draw buffer + 可见实例 ID 列表
+//      d. Pipeline Barrier: compute → indirect draw
+//      e. vkCmdDrawIndexedIndirect 使用 GPU 生成的 indirect buffer
+//   3. CPU 不做任何 culling 计算
 //
-// 对比:
-//   CPU Driven: CPU culling → 上传可见列表 → vkCmdDrawIndexed(instanceCount=可见数)
-//   GPU Driven: dispatch compute → barrier → vkCmdDrawIndexedIndirect(GPU填充参数)
+// 提供两种 culling 模式:
+//   [1] atomicAdd: 每个可见实例用 atomicAdd 获取写入位置
+//   [2] prefix sum: 工作组内做 exclusive scan，减少原子操作
 // ════════════════════════════════════════════════════════════
 
 #include <vulkan/vulkan.h>
@@ -37,29 +38,48 @@
 
 static const uint32_t WINDOW_WIDTH = 1024;
 static const uint32_t WINDOW_HEIGHT = 768;
-static const uint32_t INSTANCE_COUNT = 1000;
-static const uint32_t CUBE_VERTEX_COUNT = 24;
-static const uint32_t CUBE_INDEX_COUNT = 36;
+static const uint32_t INSTANCE_COUNT = 1000;   // 总实例数
+static const uint32_t CUBE_VERTEX_COUNT = 24;  // 立方体顶点数 (每面4个 × 6面)
+static const uint32_t CUBE_INDEX_COUNT = 36;   // 立方体索引数 (每面2三角形 × 6面)
+static const uint32_t COMPUTE_LOCAL_SIZE = 64; // 对应 shader 中 local_size_x
 
 // ════════════════ 数据结构 ════════════════
 
+// 立方体顶点 (与 cube.vert 对应)
 struct Vertex
 {
-    glm::vec3 position;
-    glm::vec3 normal;
+    glm::vec3 position; // location = 0
+    glm::vec3 normal;   // location = 1
 };
 
+// 实例数据 (与 shader 中 InstanceData 对应, std430 布局)
 struct InstanceData
 {
     glm::vec4 positionScale; // xyz = 世界坐标, w = 缩放
     glm::vec4 color;         // rgb = 颜色, a = 未使用
 };
 
+// Compute Shader UBO (与 shader 中 CullUBO 对应)
+struct CullUBO
+{
+    glm::mat4 viewProj;         // 视图投影矩阵
+    glm::vec4 frustumPlanes[6]; // 视锥体 6 个平面
+    uint32_t instanceCount;     // 实例总数
+    uint32_t pad0, pad1, pad2;  // 对齐填充
+};
+
+// Render UBO (与 cube.vert 中 RenderUBO 对应)
 struct RenderUBO
 {
-    glm::mat4 view;
-    glm::mat4 proj;
+    glm::mat4 view; // 视图矩阵
+    glm::mat4 proj; // 投影矩阵
 };
+
+// VkDrawIndexedIndirectCommand 结构 (Vulkan 标准布局)
+// ┌──────────────┬──────────────────┬────────────┬──────────────┬───────────────┐
+// │ indexCount   │ instanceCount    │ firstIndex │ vertexOffset │ firstInstance │
+// │ = 36         │ = visibleCount   │ = 0        │ = 0          │ = 0           │
+// └──────────────┴──────────────────┴────────────┴──────────────┴───────────────┘
 
 // ════════════════ 辅助函数声明 ════════════════
 
@@ -69,66 +89,35 @@ static void createBuffer(VkDevice device, VkPhysicalDevice physDev, VkDeviceSize
                          VkBufferUsageFlags usage, VkMemoryPropertyFlags props,
                          VkBuffer &buffer, VkDeviceMemory &memory);
 
-// ════════════════ CPU Frustum Culling ════════════════
-// 这是与 GPU Driven 版本的核心区别:
-//   GPU Driven: 在 compute shader 中并行检测 1000 个实例
-//   CPU Driven: 在 CPU 上顺序遍历 1000 个实例
-
-// Gribb/Hartmann 方法提取视锥体平面
+// 从 glm::mat4 投影视图矩阵中提取视锥体的6个平面
+// Gribb/Hartmann 方法
 static void extractFrustumPlanes(const glm::mat4 &vp, glm::vec4 planes[6])
 {
+    // 左平面:   row3 + row0
     planes[0] = glm::vec4(vp[0][3] + vp[0][0], vp[1][3] + vp[1][0],
-                          vp[2][3] + vp[2][0], vp[3][3] + vp[3][0]); // 左
+                          vp[2][3] + vp[2][0], vp[3][3] + vp[3][0]);
+    // 右平面:   row3 - row0
     planes[1] = glm::vec4(vp[0][3] - vp[0][0], vp[1][3] - vp[1][0],
-                          vp[2][3] - vp[2][0], vp[3][3] - vp[3][0]); // 右
+                          vp[2][3] - vp[2][0], vp[3][3] - vp[3][0]);
+    // 底平面:   row3 + row1
     planes[2] = glm::vec4(vp[0][3] + vp[0][1], vp[1][3] + vp[1][1],
-                          vp[2][3] + vp[2][1], vp[3][3] + vp[3][1]); // 底
+                          vp[2][3] + vp[2][1], vp[3][3] + vp[3][1]);
+    // 顶平面:   row3 - row1
     planes[3] = glm::vec4(vp[0][3] - vp[0][1], vp[1][3] - vp[1][1],
-                          vp[2][3] - vp[2][1], vp[3][3] - vp[3][1]); // 顶
+                          vp[2][3] - vp[2][1], vp[3][3] - vp[3][1]);
+    // 近平面:   row3 + row2
     planes[4] = glm::vec4(vp[0][3] + vp[0][2], vp[1][3] + vp[1][2],
-                          vp[2][3] + vp[2][2], vp[3][3] + vp[3][2]); // 近
+                          vp[2][3] + vp[2][2], vp[3][3] + vp[3][2]);
+    // 远平面:   row3 - row2
     planes[5] = glm::vec4(vp[0][3] - vp[0][2], vp[1][3] - vp[1][2],
-                          vp[2][3] - vp[2][2], vp[3][3] - vp[3][2]); // 远
+                          vp[2][3] - vp[2][2], vp[3][3] - vp[3][2]);
+
+    // 归一化每个平面: 使 (a,b,c) 成为单位向量
     for (int i = 0; i < 6; i++)
     {
         float len = glm::length(glm::vec3(planes[i]));
         planes[i] /= len;
     }
-}
-
-// CPU 端包围球-视锥体相交测试 (与 shader 中逻辑完全相同)
-static bool isInsideFrustum(const glm::vec4 planes[6], glm::vec3 center, float radius)
-{
-    for (int i = 0; i < 6; i++)
-    {
-        float dist = glm::dot(glm::vec3(planes[i]), center) + planes[i].w;
-        if (dist < -radius)
-            return false;
-    }
-    return true;
-}
-
-// CPU Frustum Culling: 遍历所有实例，返回可见实例的 ID 列表
-// 这正是 GPU Driven 版本中 compute shader 做的工作
-static std::vector<uint32_t> cpuFrustumCull(
-    const std::vector<InstanceData> &instances,
-    const glm::vec4 frustumPlanes[6])
-{
-    std::vector<uint32_t> visibleIDs;
-    visibleIDs.reserve(instances.size());
-
-    for (uint32_t i = 0; i < (uint32_t)instances.size(); i++)
-    {
-        glm::vec3 center(instances[i].positionScale);
-        float scale = instances[i].positionScale.w;
-        float radius = 0.866f * scale; // sqrt(3)/2 * scale
-
-        if (isInsideFrustum(frustumPlanes, center, radius))
-        {
-            visibleIDs.push_back(i);
-        }
-    }
-    return visibleIDs;
 }
 
 // ════════════════ 生成立方体网格 ════════════════
@@ -138,26 +127,43 @@ static void generateCubeMesh(std::vector<Vertex> &vertices, std::vector<uint32_t
     vertices.clear();
     indices.clear();
 
+    // 6 个面，每面 4 个唯一顶点 (独立法线)
     struct Face
     {
         glm::vec3 positions[4];
         glm::vec3 normal;
     };
 
+    // 单位立方体 [-0.5, 0.5]
     Face faces[6] = {
-        {{{-0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {-0.5f, 0.5f, 0.5f}}, {0, 0, 1}},
-        {{{0.5f, -0.5f, -0.5f}, {-0.5f, -0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}}, {0, 0, -1}},
-        {{{-0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f}}, {0, 1, 0}},
-        {{{-0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, 0.5f}, {-0.5f, -0.5f, 0.5f}}, {0, -1, 0}},
-        {{{0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}, {0.5f, 0.5f, 0.5f}}, {1, 0, 0}},
-        {{{-0.5f, -0.5f, -0.5f}, {-0.5f, -0.5f, 0.5f}, {-0.5f, 0.5f, 0.5f}, {-0.5f, 0.5f, -0.5f}}, {-1, 0, 0}},
+        // 前面 (+Z)
+        {{{-0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {-0.5f, 0.5f, 0.5f}},
+         {0.0f, 0.0f, 1.0f}},
+        // 后面 (-Z)
+        {{{0.5f, -0.5f, -0.5f}, {-0.5f, -0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}},
+         {0.0f, 0.0f, -1.0f}},
+        // 上面 (+Y)
+        {{{-0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f}},
+         {0.0f, 1.0f, 0.0f}},
+        // 下面 (-Y)
+        {{{-0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, 0.5f}, {-0.5f, -0.5f, 0.5f}},
+         {0.0f, -1.0f, 0.0f}},
+        // 右面 (+X)
+        {{{0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}, {0.5f, 0.5f, 0.5f}},
+         {1.0f, 0.0f, 0.0f}},
+        // 左面 (-X)
+        {{{-0.5f, -0.5f, -0.5f}, {-0.5f, -0.5f, 0.5f}, {-0.5f, 0.5f, 0.5f}, {-0.5f, 0.5f, -0.5f}},
+         {-1.0f, 0.0f, 0.0f}},
     };
 
     for (int f = 0; f < 6; f++)
     {
-        uint32_t base = (uint32_t)vertices.size();
+        uint32_t base = static_cast<uint32_t>(vertices.size());
         for (int v = 0; v < 4; v++)
+        {
             vertices.push_back({faces[f].positions[v], faces[f].normal});
+        }
+        // 两个三角形: 0-1-2, 0-2-3
         indices.push_back(base + 0);
         indices.push_back(base + 1);
         indices.push_back(base + 2);
@@ -172,15 +178,19 @@ static void generateCubeMesh(std::vector<Vertex> &vertices, std::vector<uint32_t
 static std::vector<InstanceData> generateInstances()
 {
     std::vector<InstanceData> instances(INSTANCE_COUNT);
-    std::mt19937 rng(42); // 固定种子，与 GPU Driven 版本一致
+    std::mt19937 rng(42); // 固定种子，可复现
     std::uniform_real_distribution<float> posDist(-20.0f, 20.0f);
     std::uniform_real_distribution<float> scaleDist(0.3f, 1.0f);
     std::uniform_real_distribution<float> colorDist(0.2f, 1.0f);
 
     for (uint32_t i = 0; i < INSTANCE_COUNT; i++)
     {
-        instances[i].positionScale = glm::vec4(posDist(rng), posDist(rng), posDist(rng), scaleDist(rng));
-        instances[i].color = glm::vec4(colorDist(rng), colorDist(rng), colorDist(rng), 1.0f);
+        instances[i].positionScale = glm::vec4(
+            posDist(rng), posDist(rng), posDist(rng), // 世界坐标
+            scaleDist(rng)                            // 缩放
+        );
+        instances[i].color = glm::vec4(
+            colorDist(rng), colorDist(rng), colorDist(rng), 1.0f);
     }
     return instances;
 }
@@ -189,10 +199,10 @@ static std::vector<InstanceData> generateInstances()
 
 int main()
 {
-    std::cout << "=== CPU Driven Rendering Demo (传统方式) ===" << std::endl;
+    std::cout << "=== GPU Driven Rendering Demo ===" << std::endl;
     std::cout << "实例数: " << INSTANCE_COUNT << std::endl;
 
-    // ─── GLFW ───
+    // ─── GLFW 初始化 ───
     if (!glfwInit())
     {
         std::cerr << "GLFW 初始化失败" << std::endl;
@@ -201,7 +211,7 @@ int main()
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
     GLFWwindow *window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT,
-                                          "CPU Driven Rendering - 1000 Cubes (Traditional)", nullptr, nullptr);
+                                          "GPU Driven Rendering - 1000 Cubes", nullptr, nullptr);
     if (!window)
     {
         std::cerr << "窗口创建失败" << std::endl;
@@ -209,15 +219,23 @@ int main()
         return 1;
     }
 
-    glfwSetKeyCallback(window, [](GLFWwindow *w, int key, int, int action, int)
+    // 当前裁剪模式: 0=atomicAdd, 1=prefix sum
+    int cullMode = 0;
+    glfwSetWindowUserPointer(window, &cullMode);
+    glfwSetKeyCallback(window, [](GLFWwindow *w, int key, int /*scancode*/, int action, int /*mods*/)
                        {
-        if (action == GLFW_PRESS && key == GLFW_KEY_ESCAPE)
-            glfwSetWindowShouldClose(w, GLFW_TRUE); });
+        if (action != GLFW_PRESS) return;
+        int* mode = (int*)glfwGetWindowUserPointer(w);
+        if (key == GLFW_KEY_1) { *mode = 0; std::cout << "[切换] atomicAdd 模式" << std::endl; }
+        if (key == GLFW_KEY_2) { *mode = 1; std::cout << "[切换] Prefix Sum 模式" << std::endl; }
+        if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(w, GLFW_TRUE); });
+
+    std::cout << "控制: [1] atomicAdd  [2] Prefix Sum  [ESC] 退出" << std::endl;
 
     // ─── Vulkan 实例 ───
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName = "CPU Driven Demo";
+    appInfo.pApplicationName = "GPU Driven Demo";
     appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;
 
@@ -239,6 +257,7 @@ int main()
         std::cerr << "Vulkan 实例创建失败" << std::endl;
         return 1;
     }
+    std::cout << "Vulkan 实例创建成功" << std::endl;
 
     // ─── Surface ───
     VkSurfaceKHR surface;
@@ -259,7 +278,7 @@ int main()
     vkGetPhysicalDeviceProperties(physicalDevice, &devProps);
     std::cout << "GPU: " << devProps.deviceName << std::endl;
 
-    // ─── 队列族 ───
+    // ─── 队列族: 同时支持 Graphics + Compute ───
     uint32_t qfCount = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &qfCount, nullptr);
     std::vector<VkQueueFamilyProperties> qfProps(qfCount);
@@ -268,7 +287,8 @@ int main()
     int queueFamily = -1;
     for (uint32_t i = 0; i < qfCount; i++)
     {
-        if (qfProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+        if ((qfProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+            (qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT))
         {
             VkBool32 presentSupport = VK_FALSE;
             vkGetPhysicalDeviceSurfaceSupportKHR(physicalDevice, i, surface, &presentSupport);
@@ -281,9 +301,10 @@ int main()
     }
     if (queueFamily < 0)
     {
-        std::cerr << "未找到合适的队列族" << std::endl;
+        std::cerr << "未找到同时支持 Graphics + Compute + Present 的队列族" << std::endl;
         return 1;
     }
+    std::cout << "队列族: " << queueFamily << " (Graphics + Compute + Present)" << std::endl;
 
     // ─── 逻辑设备 ───
     float queuePriority = 1.0f;
@@ -294,9 +315,12 @@ int main()
     queueCI.pQueuePriorities = &queuePriority;
 
     VkPhysicalDeviceFeatures features{};
+    // multiDrawIndirect 在 MoltenVK 上可能不可用，我们使用 drawIndirect 足够
+
     std::vector<const char *> devExts = {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-        "VK_KHR_portability_subset"};
+        "VK_KHR_portability_subset" // MoltenVK 需要
+    };
 
     VkDeviceCreateInfo devCI{};
     devCI.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -337,7 +361,9 @@ int main()
 
     VkExtent2D swapExtent = surfCaps.currentExtent;
     if (swapExtent.width == UINT32_MAX)
+    {
         swapExtent = {WINDOW_WIDTH, WINDOW_HEIGHT};
+    }
 
     uint32_t imageCount = std::max(2u, surfCaps.minImageCount);
     if (surfCaps.maxImageCount > 0)
@@ -381,11 +407,12 @@ int main()
         ivCI.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCreateImageView(device, &ivCI, nullptr, &swapImageViews[i]);
     }
-    std::cout << "Swapchain: " << swapImageCount << " images, "
-              << swapExtent.width << "x" << swapExtent.height << std::endl;
+    std::cout << "Swapchain 创建成功 (" << swapImageCount << " images, "
+              << swapExtent.width << "x" << swapExtent.height << ")" << std::endl;
 
     // ─── 深度缓冲 ───
     VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
+
     VkImageCreateInfo depthImgCI{};
     depthImgCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     depthImgCI.imageType = VK_IMAGE_TYPE_2D;
@@ -422,8 +449,9 @@ int main()
     VkImageView depthView;
     vkCreateImageView(device, &depthViewCI, nullptr, &depthView);
 
-    // ─── Render Pass (颜色 + 深度) ───
+    // ─── Render Pass ───
     std::array<VkAttachmentDescription, 2> attachments{};
+    // 颜色附件
     attachments[0].format = surfFmt.format;
     attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
     attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -432,7 +460,7 @@ int main()
     attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     attachments[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
+    // 深度附件
     attachments[1].format = depthFormat;
     attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
     attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -475,12 +503,12 @@ int main()
     std::vector<VkFramebuffer> framebuffers(swapImageCount);
     for (uint32_t i = 0; i < swapImageCount; i++)
     {
-        std::array<VkImageView, 2> fbAtt = {swapImageViews[i], depthView};
+        std::array<VkImageView, 2> fbAttachments = {swapImageViews[i], depthView};
         VkFramebufferCreateInfo fbCI{};
         fbCI.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         fbCI.renderPass = renderPass;
-        fbCI.attachmentCount = (uint32_t)fbAtt.size();
-        fbCI.pAttachments = fbAtt.data();
+        fbCI.attachmentCount = (uint32_t)fbAttachments.size();
+        fbCI.pAttachments = fbAttachments.data();
         fbCI.width = swapExtent.width;
         fbCI.height = swapExtent.height;
         fbCI.layers = 1;
@@ -507,15 +535,17 @@ int main()
 
     // ════════════════ 数据准备 ════════════════
 
+    // 立方体网格
     std::vector<Vertex> cubeVertices;
     std::vector<uint32_t> cubeIndices;
     generateCubeMesh(cubeVertices, cubeIndices);
     assert(cubeVertices.size() == CUBE_VERTEX_COUNT);
     assert(cubeIndices.size() == CUBE_INDEX_COUNT);
 
+    // 实例数据
     std::vector<InstanceData> instances = generateInstances();
 
-    // ─── GPU 缓冲区 ───
+    // ─── GPU 缓冲区创建 ───
 
     // 顶点缓冲
     VkBuffer vertexBuffer;
@@ -545,7 +575,7 @@ int main()
         vkUnmapMemory(device, indexMemory);
     }
 
-    // 实例 SSBO
+    // 实例 SSBO (compute + vertex 共享)
     VkBuffer instanceBuffer;
     VkDeviceMemory instanceMemory;
     VkDeviceSize instBufSize = sizeof(InstanceData) * INSTANCE_COUNT;
@@ -559,10 +589,19 @@ int main()
         vkUnmapMemory(device, instanceMemory);
     }
 
-    // Visible ID Buffer (CPU 每帧上传可见实例索引)
-    // *** 与 GPU Driven 的关键区别 ***
-    // GPU Driven: 由 compute shader 在 GPU 侧写入此缓冲
-    // CPU Driven: 由 CPU 做 culling 后 memcpy 上传
+    // Indirect Draw Buffer (VkDrawIndexedIndirectCommand = 5 × uint32_t = 20 bytes)
+    // ┌──────────────┬────────────────┬────────────┬──────────────┬───────────────┐
+    // │ indexCount(4) │instanceCount(4)│firstIndex(4)│vertexOffset(4)│firstInstance(4)│
+    // └──────────────┴────────────────┴────────────┴──────────────┴───────────────┘
+    VkBuffer indirectBuffer;
+    VkDeviceMemory indirectMemory;
+    VkDeviceSize indirectBufSize = sizeof(uint32_t) * 5;
+    createBuffer(device, physicalDevice, indirectBufSize,
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 indirectBuffer, indirectMemory);
+
+    // Visible ID Buffer (可见实例索引列表)
     VkBuffer visibleBuffer;
     VkDeviceMemory visibleMemory;
     VkDeviceSize visBufSize = sizeof(uint32_t) * INSTANCE_COUNT;
@@ -570,6 +609,13 @@ int main()
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                  visibleBuffer, visibleMemory);
+
+    // Cull UBO
+    VkBuffer cullUboBuffer;
+    VkDeviceMemory cullUboMemory;
+    createBuffer(device, physicalDevice, sizeof(CullUBO),
+                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 cullUboBuffer, cullUboMemory);
 
     // Render UBO
     VkBuffer renderUboBuffer;
@@ -581,6 +627,27 @@ int main()
     std::cout << "GPU 缓冲区创建完成" << std::endl;
 
     // ════════════════ Descriptor Set Layout ════════════════
+
+    // Compute Descriptor Set Layout (set 0)
+    // binding 0: CullUBO (uniform)
+    // binding 1: InstanceBuffer (storage, read)
+    // binding 2: IndirectBuffer (storage, read/write)
+    // binding 3: VisibleBuffer (storage, read/write)
+    std::array<VkDescriptorSetLayoutBinding, 4> compBindings{};
+    compBindings[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    compBindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    compBindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    compBindings[3] = {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+
+    VkDescriptorSetLayoutCreateInfo compDSLCI{};
+    compDSLCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    compDSLCI.bindingCount = (uint32_t)compBindings.size();
+    compDSLCI.pBindings = compBindings.data();
+
+    VkDescriptorSetLayout compDSLayout;
+    vkCreateDescriptorSetLayout(device, &compDSLCI, nullptr, &compDSLayout);
+
+    // Graphics Descriptor Set Layout (set 0)
     // binding 0: RenderUBO (uniform, vertex)
     // binding 1: InstanceBuffer (storage, vertex)
     // binding 2: VisibleBuffer (storage, vertex)
@@ -589,60 +656,98 @@ int main()
     gfxBindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
     gfxBindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
 
-    VkDescriptorSetLayoutCreateInfo dslCI{};
-    dslCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dslCI.bindingCount = (uint32_t)gfxBindings.size();
-    dslCI.pBindings = gfxBindings.data();
+    VkDescriptorSetLayoutCreateInfo gfxDSLCI{};
+    gfxDSLCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    gfxDSLCI.bindingCount = (uint32_t)gfxBindings.size();
+    gfxDSLCI.pBindings = gfxBindings.data();
 
-    VkDescriptorSetLayout dsLayout;
-    vkCreateDescriptorSetLayout(device, &dslCI, nullptr, &dsLayout);
+    VkDescriptorSetLayout gfxDSLayout;
+    vkCreateDescriptorSetLayout(device, &gfxDSLCI, nullptr, &gfxDSLayout);
 
     // ─── Descriptor Pool ───
     std::array<VkDescriptorPoolSize, 2> poolSizes{};
-    poolSizes[0] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2};
-    poolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
+    poolSizes[0] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4};
+    poolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10};
 
     VkDescriptorPoolCreateInfo dpCI{};
     dpCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpCI.maxSets = 2;
+    dpCI.maxSets = 4;
     dpCI.poolSizeCount = (uint32_t)poolSizes.size();
     dpCI.pPoolSizes = poolSizes.data();
 
     VkDescriptorPool descriptorPool;
     vkCreateDescriptorPool(device, &dpCI, nullptr, &descriptorPool);
 
-    // ─── 分配和更新 Descriptor Set ───
-    VkDescriptorSetAllocateInfo dsAI{};
-    dsAI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsAI.descriptorPool = descriptorPool;
-    dsAI.descriptorSetCount = 1;
-    dsAI.pSetLayouts = &dsLayout;
+    // ─── 分配 Descriptor Sets ───
+    // compute descriptor set (用于 cull_atomic 和 cull_scan)
+    VkDescriptorSetAllocateInfo compDSAI{};
+    compDSAI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    compDSAI.descriptorPool = descriptorPool;
+    compDSAI.descriptorSetCount = 1;
+    compDSAI.pSetLayouts = &compDSLayout;
 
-    VkDescriptorSet descSet;
-    vkAllocateDescriptorSets(device, &dsAI, &descSet);
+    VkDescriptorSet compDescSet;
+    vkAllocateDescriptorSets(device, &compDSAI, &compDescSet);
 
-    VkDescriptorBufferInfo uboInfo{renderUboBuffer, 0, sizeof(RenderUBO)};
-    VkDescriptorBufferInfo instInfo{instanceBuffer, 0, instBufSize};
-    VkDescriptorBufferInfo visInfo{visibleBuffer, 0, visBufSize};
+    // graphics descriptor set
+    VkDescriptorSetAllocateInfo gfxDSAI{};
+    gfxDSAI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    gfxDSAI.descriptorPool = descriptorPool;
+    gfxDSAI.descriptorSetCount = 1;
+    gfxDSAI.pSetLayouts = &gfxDSLayout;
 
-    std::array<VkWriteDescriptorSet, 3> writes{};
-    writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descSet, 0, 0, 1,
-                 VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo, nullptr};
-    writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descSet, 1, 0, 1,
-                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &instInfo, nullptr};
-    writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descSet, 2, 0, 1,
-                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &visInfo, nullptr};
-    vkUpdateDescriptorSets(device, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+    VkDescriptorSet gfxDescSet;
+    vkAllocateDescriptorSets(device, &gfxDSAI, &gfxDescSet);
+
+    // ─── 更新 Descriptor Sets ───
+    // Compute set
+    VkDescriptorBufferInfo compUboInfo{cullUboBuffer, 0, sizeof(CullUBO)};
+    VkDescriptorBufferInfo compInstInfo{instanceBuffer, 0, instBufSize};
+    VkDescriptorBufferInfo compIndirectInfo{indirectBuffer, 0, indirectBufSize};
+    VkDescriptorBufferInfo compVisInfo{visibleBuffer, 0, visBufSize};
+
+    std::array<VkWriteDescriptorSet, 4> compWrites{};
+    compWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, compDescSet, 0, 0, 1,
+                     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &compUboInfo, nullptr};
+    compWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, compDescSet, 1, 0, 1,
+                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compInstInfo, nullptr};
+    compWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, compDescSet, 2, 0, 1,
+                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compIndirectInfo, nullptr};
+    compWrites[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, compDescSet, 3, 0, 1,
+                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &compVisInfo, nullptr};
+    vkUpdateDescriptorSets(device, (uint32_t)compWrites.size(), compWrites.data(), 0, nullptr);
+
+    // Graphics set
+    VkDescriptorBufferInfo gfxUboInfo{renderUboBuffer, 0, sizeof(RenderUBO)};
+    VkDescriptorBufferInfo gfxInstInfo{instanceBuffer, 0, instBufSize};
+    VkDescriptorBufferInfo gfxVisInfo{visibleBuffer, 0, visBufSize};
+
+    std::array<VkWriteDescriptorSet, 3> gfxWrites{};
+    gfxWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, gfxDescSet, 0, 0, 1,
+                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &gfxUboInfo, nullptr};
+    gfxWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, gfxDescSet, 1, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &gfxInstInfo, nullptr};
+    gfxWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, gfxDescSet, 2, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &gfxVisInfo, nullptr};
+    vkUpdateDescriptorSets(device, (uint32_t)gfxWrites.size(), gfxWrites.data(), 0, nullptr);
 
     // ════════════════ Pipeline Layout ════════════════
 
-    VkPipelineLayoutCreateInfo plCI{};
-    plCI.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plCI.setLayoutCount = 1;
-    plCI.pSetLayouts = &dsLayout;
+    VkPipelineLayoutCreateInfo compPLCI{};
+    compPLCI.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    compPLCI.setLayoutCount = 1;
+    compPLCI.pSetLayouts = &compDSLayout;
 
-    VkPipelineLayout pipelineLayout;
-    vkCreatePipelineLayout(device, &plCI, nullptr, &pipelineLayout);
+    VkPipelineLayout compPipelineLayout;
+    vkCreatePipelineLayout(device, &compPLCI, nullptr, &compPipelineLayout);
+
+    VkPipelineLayoutCreateInfo gfxPLCI{};
+    gfxPLCI.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    gfxPLCI.setLayoutCount = 1;
+    gfxPLCI.pSetLayouts = &gfxDSLayout;
+
+    VkPipelineLayout gfxPipelineLayout;
+    vkCreatePipelineLayout(device, &gfxPLCI, nullptr, &gfxPipelineLayout);
 
     // ════════════════ Shader Modules ════════════════
 
@@ -656,16 +761,41 @@ int main()
         VkShaderModule sm;
         if (vkCreateShaderModule(device, &smCI, nullptr, &sm) != VK_SUCCESS)
         {
-            std::cerr << "Shader 加载失败: " << path << std::endl;
+            std::cerr << "Shader module 创建失败: " << path << std::endl;
             exit(1);
         }
         return sm;
     };
 
     std::string shaderDir = SHADER_DIR;
+    VkShaderModule cullAtomicSM = loadShaderModule(shaderDir + "cull_atomic.comp.spv");
+    VkShaderModule cullScanSM = loadShaderModule(shaderDir + "cull_scan.comp.spv");
     VkShaderModule vertSM = loadShaderModule(shaderDir + "cube.vert.spv");
     VkShaderModule fragSM = loadShaderModule(shaderDir + "cube.frag.spv");
     std::cout << "Shader 加载成功" << std::endl;
+
+    // ════════════════ Compute Pipelines ════════════════
+
+    auto createComputePipeline = [&](VkShaderModule sm) -> VkPipeline
+    {
+        VkPipelineShaderStageCreateInfo stageCI{};
+        stageCI.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stageCI.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stageCI.module = sm;
+        stageCI.pName = "main";
+
+        VkComputePipelineCreateInfo cpCI{};
+        cpCI.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpCI.stage = stageCI;
+        cpCI.layout = compPipelineLayout;
+
+        VkPipeline pipeline;
+        vkCreateComputePipelines(device, nullptr, 1, &cpCI, nullptr, &pipeline);
+        return pipeline;
+    };
+
+    VkPipeline cullAtomicPipeline = createComputePipeline(cullAtomicSM);
+    VkPipeline cullScanPipeline = createComputePipeline(cullScanSM);
 
     // ════════════════ Graphics Pipeline ════════════════
 
@@ -681,9 +811,11 @@ int main()
     fragStage.module = fragSM;
     fragStage.pName = "main";
 
-    VkPipelineShaderStageCreateInfo stages[] = {vertStage, fragStage};
+    VkPipelineShaderStageCreateInfo gfxStages[] = {vertStage, fragStage};
 
+    // 顶点输入 (仅立方体网格顶点，实例数据从 SSBO 读取)
     VkVertexInputBindingDescription vbBind{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
+
     std::array<VkVertexInputAttributeDescription, 2> vbAttrs{};
     vbAttrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, position)};
     vbAttrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)};
@@ -720,11 +852,11 @@ int main()
     msCI.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     msCI.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-    VkPipelineDepthStencilStateCreateInfo dsStateCI{};
-    dsStateCI.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    dsStateCI.depthTestEnable = VK_TRUE;
-    dsStateCI.depthWriteEnable = VK_TRUE;
-    dsStateCI.depthCompareOp = VK_COMPARE_OP_LESS;
+    VkPipelineDepthStencilStateCreateInfo dsCI{};
+    dsCI.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    dsCI.depthTestEnable = VK_TRUE;
+    dsCI.depthWriteEnable = VK_TRUE;
+    dsCI.depthCompareOp = VK_COMPARE_OP_LESS;
 
     VkPipelineColorBlendAttachmentState cbAtt{};
     cbAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -738,15 +870,15 @@ int main()
     VkGraphicsPipelineCreateInfo gpCI{};
     gpCI.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     gpCI.stageCount = 2;
-    gpCI.pStages = stages;
+    gpCI.pStages = gfxStages;
     gpCI.pVertexInputState = &viCI;
     gpCI.pInputAssemblyState = &iaCI;
     gpCI.pViewportState = &vpCI;
     gpCI.pRasterizationState = &rsCI;
     gpCI.pMultisampleState = &msCI;
-    gpCI.pDepthStencilState = &dsStateCI;
+    gpCI.pDepthStencilState = &dsCI;
     gpCI.pColorBlendState = &cbCI;
-    gpCI.layout = pipelineLayout;
+    gpCI.layout = gfxPipelineLayout;
     gpCI.renderPass = renderPass;
     gpCI.subpass = 0;
 
@@ -758,6 +890,9 @@ int main()
     }
     std::cout << "管线创建完成" << std::endl;
 
+    // 销毁 shader modules (已编译进 pipeline)
+    vkDestroyShaderModule(device, cullAtomicSM, nullptr);
+    vkDestroyShaderModule(device, cullScanSM, nullptr);
     vkDestroyShaderModule(device, vertSM, nullptr);
     vkDestroyShaderModule(device, fragSM, nullptr);
 
@@ -772,8 +907,7 @@ int main()
     vkCreateFence(device, &fenCI, nullptr, &inFlightFence);
 
     // ════════════════ 主循环 ════════════════
-    std::cout << "\n=== 渲染循环开始 (CPU Driven) ===" << std::endl;
-    std::cout << "按 [ESC] 退出" << std::endl;
+    std::cout << "\n=== 渲染循环开始 ===" << std::endl;
 
     float time = 0.0f;
     uint32_t frameCount = 0;
@@ -781,9 +915,9 @@ int main()
     while (!glfwWindowShouldClose(window))
     {
         glfwPollEvents();
-        time += 0.016f;
+        time += 0.016f; // ~60fps
 
-        // ─── 相机绕原点旋转 (与 GPU Driven 完全相同) ───
+        // ─── 相机绕原点旋转 ───
         float camRadius = 35.0f;
         float camAngle = time * 0.5f;
         glm::vec3 camPos(camRadius * cosf(camAngle), 15.0f, camRadius * sinf(camAngle));
@@ -793,9 +927,22 @@ int main()
         glm::mat4 view = glm::lookAt(camPos, camTarget, camUp);
         glm::mat4 proj = glm::perspective(glm::radians(60.0f),
                                           (float)swapExtent.width / (float)swapExtent.height, 0.1f, 100.0f);
-        proj[1][1] *= -1.0f; // Vulkan Y 轴翻转
+        // Vulkan Y 轴翻转
+        proj[1][1] *= -1.0f;
 
         glm::mat4 viewProj = proj * view;
+
+        // ─── 更新 Cull UBO ───
+        CullUBO cullUbo{};
+        cullUbo.viewProj = viewProj;
+        extractFrustumPlanes(viewProj, cullUbo.frustumPlanes);
+        cullUbo.instanceCount = INSTANCE_COUNT;
+        {
+            void *data;
+            vkMapMemory(device, cullUboMemory, 0, sizeof(CullUBO), 0, &data);
+            memcpy(data, &cullUbo, sizeof(CullUBO));
+            vkUnmapMemory(device, cullUboMemory);
+        }
 
         // ─── 更新 Render UBO ───
         RenderUBO renderUbo{};
@@ -808,25 +955,18 @@ int main()
             vkUnmapMemory(device, renderUboMemory);
         }
 
-        // ═══ CPU Frustum Culling ═══
-        // *** 这是与 GPU Driven 版本的核心区别 ***
-        // GPU Driven: vkCmdDispatch(compute shader) → 在 GPU 上并行完成
-        // CPU Driven: CPU 顺序遍历 1000 个实例，逐一测试
-        glm::vec4 frustumPlanes[6];
-        extractFrustumPlanes(viewProj, frustumPlanes);
-
-        std::vector<uint32_t> visibleIDs = cpuFrustumCull(instances, frustumPlanes);
-        uint32_t visibleCount = (uint32_t)visibleIDs.size();
-
-        // ── CPU 上传可见 ID 列表到 GPU ──
-        // GPU Driven 版本中这一步由 compute shader 直接在 GPU 完成
-        // CPU Driven 需要 map → memcpy → unmap
-        if (visibleCount > 0)
+        // ─── 重置 Indirect Buffer ───
+        // 每帧开始前，将 instanceCount 设为 0，indexCount 设为 36
         {
             void *data;
-            vkMapMemory(device, visibleMemory, 0, sizeof(uint32_t) * visibleCount, 0, &data);
-            memcpy(data, visibleIDs.data(), sizeof(uint32_t) * visibleCount);
-            vkUnmapMemory(device, visibleMemory);
+            vkMapMemory(device, indirectMemory, 0, indirectBufSize, 0, &data);
+            uint32_t *ptr = (uint32_t *)data;
+            ptr[0] = CUBE_INDEX_COUNT; // indexCount = 36
+            ptr[1] = 0;                // instanceCount = 0 (compute 填充)
+            ptr[2] = 0;                // firstIndex = 0
+            ptr[3] = 0;                // vertexOffset = 0
+            ptr[4] = 0;                // firstInstance = 0
+            vkUnmapMemory(device, indirectMemory);
         }
 
         // ─── 等待上一帧完成 ───
@@ -841,14 +981,41 @@ int main()
         VkCommandBufferBeginInfo beginCI{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         vkBeginCommandBuffer(commandBuffer, &beginCI);
 
-        // *** 注意: 没有 compute dispatch 和 pipeline barrier ***
-        // GPU Driven 版本在这里会有:
-        //   vkCmdBindPipeline(COMPUTE)
-        //   vkCmdDispatch(groupCount, 1, 1)
-        //   vkCmdPipelineBarrier(COMPUTE → DRAW_INDIRECT)
+        // ═══ 阶段 1: Compute Dispatch (GPU Frustum Culling) ═══
+        VkPipeline currentCullPipeline = (cullMode == 0) ? cullAtomicPipeline : cullScanPipeline;
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, currentCullPipeline);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                compPipelineLayout, 0, 1, &compDescSet, 0, nullptr);
 
+        // 计算 dispatch 大小: ceil(instanceCount / localSize)
+        uint32_t groupCount = (INSTANCE_COUNT + COMPUTE_LOCAL_SIZE - 1) / COMPUTE_LOCAL_SIZE;
+        vkCmdDispatch(commandBuffer, groupCount, 1, 1);
+
+        // ═══ Pipeline Barrier: Compute → Draw Indirect ═══
+        // 作用:
+        //   1. 确保 compute shader 对 indirect buffer 的写入完成
+        //      (SHADER_WRITE → INDIRECT_COMMAND_READ)
+        //   2. 确保 compute shader 对 visible ID buffer 的写入完成
+        //      (SHADER_WRITE → SHADER_READ)
+        //
+        // 没有这个 barrier，GPU 可能在 compute 还没写完时就开始读取
+        // indirect buffer 执行绘制，导致渲染结果错误或崩溃
+        VkMemoryBarrier memBarrier{};
+        memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        memBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        memBarrier.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+
+        vkCmdPipelineBarrier(commandBuffer,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,                                      // src: compute 完成后
+                             VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, // dst: indirect draw + vertex shader 开始前
+                             0,
+                             1, &memBarrier, // global memory barrier
+                             0, nullptr,
+                             0, nullptr);
+
+        // ═══ 阶段 2: Graphics Render Pass ═══
         std::array<VkClearValue, 2> clearValues{};
-        clearValues[0].color = {{0.05f, 0.05f, 0.1f, 1.0f}};
+        clearValues[0].color = {{0.05f, 0.05f, 0.1f, 1.0f}}; // 深蓝色背景
         clearValues[1].depthStencil = {1.0f, 0};
 
         VkRenderPassBeginInfo rpBeginInfo{};
@@ -863,30 +1030,23 @@ int main()
 
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                pipelineLayout, 0, 1, &descSet, 0, nullptr);
+                                gfxPipelineLayout, 0, 1, &gfxDescSet, 0, nullptr);
 
+        // 绑定立方体网格
         VkBuffer vbs[] = {vertexBuffer};
         VkDeviceSize offsets[] = {0};
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, vbs, offsets);
         vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT32);
 
-        // ═══ CPU Driven 核心: vkCmdDrawIndexed ═══
-        // CPU 已经知道 visibleCount，直接作为 instanceCount 参数传入
-        // 对比 GPU Driven: vkCmdDrawIndexedIndirect(buffer) → instanceCount 由 GPU 写入
-        if (visibleCount > 0)
-        {
-            vkCmdDrawIndexed(commandBuffer,
-                             CUBE_INDEX_COUNT, // indexCount = 36 (立方体)
-                             visibleCount,     // instanceCount = CPU culling 后的可见数 ← CPU 决定
-                             0,                // firstIndex
-                             0,                // vertexOffset
-                             0);               // firstInstance
-        }
+        // ═══ GPU Driven 核心: vkCmdDrawIndexedIndirect ═══
+        // 绘制参数完全来自 GPU 写的 indirect buffer
+        // CPU 不知道有多少实例可见，也不需要知道
+        vkCmdDrawIndexedIndirect(commandBuffer, indirectBuffer, 0, 1, 0);
 
         vkCmdEndRenderPass(commandBuffer);
         vkEndCommandBuffer(commandBuffer);
 
-        // ─── 提交 ───
+        // ─── 提交命令 ───
         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo submitInfo{};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -914,8 +1074,8 @@ int main()
         frameCount++;
         if (frameCount % 300 == 0)
         {
-            std::cout << "[帧 " << frameCount << "] CPU Culling: "
-                      << visibleCount << "/" << INSTANCE_COUNT << " 实例可见" << std::endl;
+            std::cout << "[帧 " << frameCount << "] 模式: "
+                      << (cullMode == 0 ? "atomicAdd" : "Prefix Sum") << std::endl;
         }
     }
 
@@ -931,9 +1091,13 @@ int main()
     vkDestroyCommandPool(device, commandPool, nullptr);
 
     vkDestroyPipeline(device, graphicsPipeline, nullptr);
-    vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+    vkDestroyPipeline(device, cullAtomicPipeline, nullptr);
+    vkDestroyPipeline(device, cullScanPipeline, nullptr);
+    vkDestroyPipelineLayout(device, gfxPipelineLayout, nullptr);
+    vkDestroyPipelineLayout(device, compPipelineLayout, nullptr);
     vkDestroyDescriptorPool(device, descriptorPool, nullptr);
-    vkDestroyDescriptorSetLayout(device, dsLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device, compDSLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device, gfxDSLayout, nullptr);
 
     for (auto fb : framebuffers)
         vkDestroyFramebuffer(device, fb, nullptr);
@@ -947,7 +1111,9 @@ int main()
     destroyBuf(vertexBuffer, vertexMemory);
     destroyBuf(indexBuffer, indexMemory);
     destroyBuf(instanceBuffer, instanceMemory);
+    destroyBuf(indirectBuffer, indirectMemory);
     destroyBuf(visibleBuffer, visibleMemory);
+    destroyBuf(cullUboBuffer, cullUboMemory);
     destroyBuf(renderUboBuffer, renderUboMemory);
 
     vkDestroyImageView(device, depthView, nullptr);
@@ -991,7 +1157,9 @@ static uint32_t findMemoryType(VkPhysicalDevice physDev, uint32_t typeFilter, Vk
     for (uint32_t i = 0; i < memProps.memoryTypeCount; i++)
     {
         if ((typeFilter & (1 << i)) && (memProps.memoryTypes[i].propertyFlags & props) == props)
+        {
             return i;
+        }
     }
     std::cerr << "未找到合适的内存类型" << std::endl;
     exit(1);
